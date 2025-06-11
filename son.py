@@ -925,8 +925,59 @@ class FTIRApp:
                                               arrowprops=dict(arrowstyle="->"))
         self.annotation.set_visible(False)
         
+        # Spektrum görüntüleyici event handler'ları
         self.spec_canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
         self.spec_canvas.mpl_connect("axes_leave_event", self.on_leave_axes)
+
+        # Molekül görüntüleyici event handler'ları
+        self.mol_canvas.mpl_connect("motion_notify_event", self.on_mol_mouse_move)
+        self.mol_canvas.mpl_connect("axes_leave_event", self.on_mol_mouse_leave)
+
+        # İmleç etkileşimi için gerekli nesneleri oluştur
+        self.cursor = Cursor(self.spec_ax, useblit=True, color='red', linewidth=1)
+        
+        # Wavenumber gösterimi için metin nesnesini başlat
+        self.wavenumber_text = None
+        
+        # Vurgulama bölgesi için değişken
+        self.highlight_region = []
+
+
+    def get_smarts_pattern(self, group):
+        """Fonksiyonel grup için SMARTS deseni döndür"""
+        patterns = {
+            'alcohol': '[OH1][CX4]',
+            'amine': '[NX3;H2,H1;!$(NC=O)]',
+            'carboxylic_acid': '[CX3](=O)[OH]',
+            'ester': '[CX3](=O)[OX2H0][#6]',
+            'aldehyde': '[CX3H1](=O)[#6]',
+            'ketone': '[CX3](=O)[#6]',
+            'ether': '[OD2]([#6])[#6]',
+            'alkene': '[CX3]=[CX3]',
+            'alkyne': '[CX2]#[CX2]',
+            'aromatic': 'c1ccccc1',
+            'amide': '[NX3][CX3](=[OX1])[#6]',
+            'nitrile': '[NX1]#[CX2]',
+            'thiol': '[SH]',
+            'halide': '[F,Cl,Br,I]',
+            'nitro': '[NX3](=O)=O',
+            'sulfoxide': '[SX3](=O)([#6])[#6]',
+            'sulfone': '[SX4](=O)(=O)([#6])[#6]',
+            'anhydride': '[CX3](=O)[OX2][CX3](=O)',
+            'imide': '[CX3](=O)[NX3][CX3](=O)',
+            'azide': '[NX3]=[NX2+]=[NX3-]',
+            'isocyanate': '[NX2]=[CX2]=[OX1]',
+            'thiocyanate': '[SX2][CX2]#[NX1]',
+            'ketene': '[CX2]=[CX2]=[OX1]',
+            'carbodiimide': '[NX2]=[CX2]=[NX2]',
+            'isothiocyanate': '[NX2]=[CX2]=[SX1]',
+            'allene': '[CX2]=[CX2]=[CX2]',
+            'phenol': '[OH1][c]',  
+            'ketenimine': '[CX2]=[CX2]=[NX2]'
+            # ... (diğer gruplar için desenler)
+        }
+        return patterns.get(group, '[#6]')  # Varsayılan olarak karbon atomu
+
         
     def browse_file(self):
         """Modern file browser with better UX from ftir.py"""
@@ -997,48 +1048,6 @@ class FTIRApp:
             self.mol_info.config(text="No molecule loaded")
             self.groups_text.delete(1.0, tk.END)
     
-    def on_mouse_move(self, event):
-        """Geliştirilmiş fare hareketi işleyicisi"""
-        if event.inaxes != self.spec_ax or not hasattr(self, 'peak_assignments'):
-            return
-        
-        x = event.xdata
-        y = event.ydata
-        
-        # En yakın pik atamasını bul
-        closest_peak = None
-        min_dist = float('inf')
-        
-        for peak in self.peak_assignments:
-            dist = abs(x - peak['center'])
-            if dist < min_dist and dist < 50:  # 50 cm⁻¹ içinde
-                min_dist = dist
-                closest_peak = peak
-        
-        if closest_peak:
-            # Açıklamayı güncelle
-            text = (f"{closest_peak['type'].title()}\n"
-                   f"{closest_peak['group'].replace('_', ' ').title()}\n"
-                   f"{closest_peak['range'][0]:.0f}-{closest_peak['range'][1]:.0f} cm⁻¹\n"
-                   f"Appearance: {closest_peak['appearance']}\n"
-                   f"Comments: {closest_peak['comments']}")
-            
-            self.annotation.xy = (x, y)
-            self.annotation.set_text(text)
-            self.annotation.set_visible(True)
-            
-            # İlgili bağları vurgula
-            self.highlight_bonds(closest_peak)
-        else:
-            self.annotation.set_visible(False)
-            # Vurgulamaları temizle ve orijinal molekülü göster
-            if self.original_mol_img is not None:
-                self.mol_ax.clear()
-                self.mol_ax.imshow(self.original_mol_img)
-                self.mol_ax.axis('off')
-                self.mol_canvas.draw()
-        
-        self.spec_canvas.draw_idle()
     
     def highlight_bonds(self, peak_info):
         # Renk tanımları
@@ -1200,11 +1209,199 @@ class FTIRApp:
         self.mol_ax.axis('off')
         self.mol_canvas.draw()
       
+    def on_mouse_move(self, event):
+        """Spektrum üzerinde fare hareketi"""
+        if event.inaxes != self.spec_ax:
+            return
+            
+        x = event.xdata
+        y = event.ydata
+        
+        if x is None or y is None:
+            return
+            
+        # Dalga sayısını küçük punto ile göster
+        if self.wavenumber_text is not None:
+            self.wavenumber_text.remove()
+        self.wavenumber_text = self.spec_ax.text(
+            x, 5,  # x konumu ve y=5 (alt kısımda)
+            f'{x:.0f} cm⁻¹',
+            fontsize=8,
+            ha='center',
+            va='bottom',
+            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none')
+        )
+        
+        # En yakın pik atamasını bul
+        if hasattr(self, 'peak_assignments'):
+            closest_peak = None
+            min_dist = float('inf')
+            
+            for peak in self.peak_assignments:
+                dist = abs(x - peak['center'])
+                if dist < min_dist and dist < 50:  # 50 cm⁻¹ içinde
+                    min_dist = dist
+                    closest_peak = peak
+            
+            if closest_peak:
+                # Spektrumda ilgili bölgeyi kırmızı olarak vurgula
+                for artist in self.highlight_region:
+                    artist.remove()
+                self.highlight_region = []
+                
+                # Yeni vurgulamayı ekle
+                range_start = closest_peak['range'][0]
+                range_end = closest_peak['range'][1]
+                
+                self.highlight_region.append(
+                    self.spec_ax.axvspan(
+                        range_start, 
+                        range_end,
+                        color='red',
+                        alpha=0.2
+                    )
+                )
+                
+                # İlgili fonksiyonel grubu molekül üzerinde vurgula
+                self.highlight_bonds(closest_peak)
+                
+        self.spec_canvas.draw_idle()
+
+    def on_mol_mouse_move(self, event):
+        """Molekül üzerinde fare hareketi - çift yönlü etkileşim"""
+        if event.inaxes != self.mol_ax or self.current_mol is None:
+            return
+            
+        x = event.xdata
+        y = event.ydata
+        
+        # Fare konumuna en yakın atomu ve fonksiyonel grubu bul
+        if self.current_mol and hasattr(self, 'peak_assignments'):
+            closest_atom = None
+            min_dist = float('inf')
+            
+            # Piksel koordinatlarını al
+            for atom in self.current_mol.GetAtoms():
+                pos = self.current_mol.GetConformer().GetAtomPosition(atom.GetIdx())
+                dist = ((x - pos.x) ** 2 + (y - pos.y) ** 2) ** 0.5
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_atom = atom
+
+            if closest_atom and min_dist < 0.5:  # Atom yeterince yakınsa
+                atom_idx = closest_atom.GetIdx()
+                matching_peaks = []
+                
+                # Bu atoma bağlı fonksiyonel grupları bul
+                for peak in self.peak_assignments:
+                    group = peak.get('group', '')
+                    if group:
+                        smarts = self.get_smarts_pattern(group)
+                        if smarts:
+                            pattern = Chem.MolFromSmarts(smarts)
+                            if pattern:
+                                matches = self.current_mol.GetSubstructMatches(pattern)
+                                for match in matches:
+                                    if atom_idx in match:
+                                        matching_peaks.append(peak)
+                                        break
+
+                # Eğer eşleşen pikler varsa spektrumda vurgula
+                if matching_peaks:
+                    # Önce eski vurgulamaları temizle
+                    for artist in self.highlight_region:
+                        artist.remove()
+                    self.highlight_region = []
+                    
+                    # Her eşleşen pik için bir vurgulama bölgesi ekle
+                    for peak in matching_peaks:
+                        range_start = peak['range'][0]
+                        range_end = peak['range'][1]
+                        
+                        # Spektrumda bölgeyi kırmızı olarak vurgula
+                        highlight = self.spec_ax.axvspan(
+                            range_start,
+                            range_end,
+                            color='red',
+                            alpha=0.2
+                        )
+                        self.highlight_region.append(highlight)
+                        
+                        # Dalga sayısı aralığını gösteren metin
+                        if self.wavenumber_text is not None:
+                            self.wavenumber_text.remove()
+                        self.wavenumber_text = self.spec_ax.text(
+                            (range_start + range_end) / 2,  # Orta nokta
+                            10,  # Y pozisyonu
+                            f'{range_start:.0f}-{range_end:.0f} cm⁻¹\n{peak["group"].replace("_", " ").title()}',
+                            fontsize=8,
+                            ha='center',
+                            va='bottom',
+                            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none')
+                        )
+                    
+                    # Molekül üzerinde ilgili atomları vurgula
+                    self.highlight_bonds_for_atom(closest_atom)
+                    
+                    self.spec_canvas.draw_idle()
+                    self.mol_canvas.draw_idle()
+
+    def highlight_bonds_for_atom(self, atom):
+        """Belirli bir atomla ilişkili bağları vurgula"""
+        if self.current_mol is None:
+            return
+            
+        highlight_atoms = set()
+        highlight_bonds = set()
+        
+        # Merkez atomu ekle
+        atom_idx = atom.GetIdx()
+        highlight_atoms.add(atom_idx)
+        
+        # Bağlı atomları ve bağları ekle
+        for bond in atom.GetBonds():
+            begin_atom = bond.GetBeginAtomIdx()
+            end_atom = bond.GetEndAtomIdx()
+            highlight_atoms.add(begin_atom)
+            highlight_atoms.add(end_atom)
+            highlight_bonds.add(bond.GetIdx())
+        
+        # Molekülü vurgulanmış şekilde çiz
+        highlight_atoms = list(highlight_atoms)
+        highlight_bonds = list(highlight_bonds)
+        
+        atom_colors = {i: (0.8, 0.2, 0.2) for i in highlight_atoms}  # Kırmızı
+        bond_colors = {i: (0.8, 0.2, 0.2) for i in highlight_bonds}  # Kırmızı
+        
+        img = Draw.MolToImage(self.current_mol, size=(400, 300),
+                             highlightAtoms=highlight_atoms,
+                             highlightBonds=highlight_bonds,
+                             highlightAtomColors=atom_colors,
+                             highlightBondColors=bond_colors)
+        
+        # Görüntüyü güncelle
+        self.mol_ax.clear()
+        self.mol_ax.imshow(img)
+        self.mol_ax.axis('off')
+
+    def on_mol_mouse_leave(self, event):
+        """Molekülden fare çıkınca vurgulamayı temizle"""
+        for artist in self.highlight_region:
+            artist.remove()
+        self.highlight_region = []
+        self.spec_canvas.draw_idle()
+
     def on_leave_axes(self, event):
-        """Eksenlerden çıkınca açıklamayı gizle"""
-        if self.annotation.get_visible():
-            self.annotation.set_visible(False)
-            self.spec_canvas.draw_idle()
+        """Spektrumdan fare çıkınca temizle"""
+        if self.wavenumber_text is not None:
+            self.wavenumber_text.remove()
+            self.wavenumber_text = None
+        
+        for artist in self.highlight_region:
+            artist.remove()
+        self.highlight_region = []
+        
+        self.spec_canvas.draw_idle()
 
     def setup_spectrum_plot(self):
         """Standart IR grafiği (0% altta, 100% üstte)"""
